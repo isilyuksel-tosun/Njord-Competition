@@ -4,6 +4,7 @@
 # ZED Camera SDK
 # Note: pyzed-5.1-cp312-cp312-linux_x86_64.whl has been provided separately
 # Install with: pip install pyzed-5.1-cp312-cp312-linux_x86_64.whl
+# python /usr/local/zed/get_python_api.py
 
 # Core dependencies
 numpy>=1.24.0
