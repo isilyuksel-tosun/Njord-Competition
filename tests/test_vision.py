@@ -286,7 +286,7 @@ def main():
             step_total = t_show - t_loop_start
 
             if step_total > 0.15:  # 150ms üzeri = gözle görülür takılma
-                print(f"[YAVAŞ FRAME] toplam={step_total * 1000:.0f}ms | "
+                print(f"[SLOW FRAME] TOTAL={step_total * 1000:.0f}ms | "
                       f"grab={step_grab * 1000:.0f}ms retrieve={step_retrieve * 1000:.0f}ms "
                       f"convert={step_convert * 1000:.0f}ms detect={step_detect * 1000:.0f}ms "
                       f"draw={step_draw * 1000:.0f}ms show={step_show * 1000:.0f}ms")
