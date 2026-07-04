@@ -15,8 +15,8 @@ latest_timestamp = None  # ms
 data_lock = threading.Lock()
 data_event = threading.Event()
 
-RGB_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 4)  # ZED VGA çözünürlük, BGRA
-DEPTH_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH)  # float32, metre
+RGB_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 4)
+DEPTH_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH)
 
 # Create Shared Memory for RGB, Depth, and Metadata
 _rgb_shm = shared_memory.SharedMemory(name="RGB_DATA", create=True, size=int(np.prod(RGB_SHAPE)))
