@@ -51,21 +51,21 @@ class VisionNode(Node):
 
         wanted = TASK_DETECTOR_MAP.get(task)
         if wanted is None:
-            self.get_logger().warn(f"Bilinmeyen görev: '{task}', detector durumu değiştirilmiyor.")
+            self.get_logger().warn(f"Unknown task: '{task}', detector state unchanged.")
             return
 
         self.current_task = task
-        self.get_logger().info(f"Görev değişti -> '{task}', aktif detector: {wanted}")
+        self.get_logger().info(f"Task changed -> '{task}', active detectors: {wanted}")
 
         for name in list(self.detectors.keys()):
             if name not in wanted:
-                self.get_logger().info(f"'{name}' detector kapatılıyor...")
+                self.get_logger().info(f"Closing '{name}' detector...")
                 del self.detectors[name]
 
         for name in wanted:
             if name not in self.detectors:
                 cls, model_path = DETECTOR_REGISTRY[name]
-                self.get_logger().info(f"'{name}' detector yükleniyor...")
+                self.get_logger().info(f"Loading '{name}' detector...")
                 self.detectors[name] = cls(model_path=model_path)
 
         try:

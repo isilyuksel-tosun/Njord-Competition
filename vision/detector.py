@@ -1,8 +1,11 @@
+import time
 from pathlib import Path
 
+import numpy as np
 from ultralytics import YOLO
 
-from config.vision_config import DEVICE, BUOY_MODEL_PATH, VESSEL_MODEL_PATH
+from config.camera_config import CAMERA_WIDTH
+from config.vision_config import DEVICE, BUOY_MODEL_PATH, VESSEL_MODEL_PATH, TOLERANCE_RATIO, TOLARANCE_DEG
 from vision.depth_utils import get_distance_from_bbox
 
 
@@ -12,32 +15,37 @@ class BaseYOLODetector:
         if not model_p.is_absolute():
             project_root = Path(__file__).resolve().parent.parent
             model_p = project_root / model_path
-
         self.model = YOLO(str(model_p))
         self.device = device
-
         self.class_names = self.model.names
 
     def detect(self, bgr_image, depth_array):
+        t0 = time.time()
         results = self.model(bgr_image, device=self.device, verbose=False)
+        t1 = time.time()
+
+        boxes = results[0].boxes
         detections = []
 
-        for box in results[0].boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-            cls_id = int(box.cls[0].cpu().numpy())
-            conf = float(box.conf[0].cpu().numpy())
+        if len(boxes) > 0:
+            xyxy_all = boxes.xyxy.cpu().numpy()
+            cls_all = boxes.cls.cpu().numpy()
+            conf_all = boxes.conf.cpu().numpy()
 
-            class_name = self.class_names.get(cls_id, f"unknown_{cls_id}")
-            bbox = [x1, y1, x2, y2]
-
-            distance = get_distance_from_bbox(depth_array, bbox, method="median")
-
-            detections.append({
-                "class": class_name,
-                "confidence": round(conf, 3),
-                "distance": round(distance, 2),
-                "bbox": bboxf
-            })
+            for i in range(len(boxes)):
+                x1, y1, x2, y2 = map(int, xyxy_all[i])
+                cls_id = int(cls_all[i])
+                conf = float(conf_all[i])
+                class_name = self.class_names.get(cls_id, f"unknown_{cls_id}")
+                bbox = [x1, y1, x2, y2]
+                distance = get_distance_from_bbox(depth_array, bbox, method="median")
+                detections.append({
+                    "class": class_name,
+                    "confidence": round(conf, 3),
+                    "distance": round(distance, 2),
+                    "bbox": bbox
+                })
+        t2 = time.time()
 
         return detections
 
@@ -48,18 +56,59 @@ class BuoyDetector(BaseYOLODetector):
 
 
 class VesselDetector(BaseYOLODetector):
-    def __init__(self, model_path=VESSEL_MODEL_PATH, device=DEVICE):
+    def __init__(self, model_path=VESSEL_MODEL_PATH, device=DEVICE, fx=None, cx=None):
         super().__init__(model_path, device)
+        # ZED kalibrasyonundan gelen intrinsics. Kamera açıldıktan sonra
+        # zed.get_camera_information() ile okunup buraya geçirilmeli.
+        # fx=None kalırsa _compute_angle güvenli bir fallback kullanır.
+        self.fx = fx
+        self.cx = cx if cx is not None else CAMERA_WIDTH / 2
 
     def detect(self, bgr_image, depth_array):
         detections = super().detect(bgr_image, depth_array)
         for det in detections:
-            det["your_measurement"] = self._compute_measurement(det, depth_array)
+            det["Vessel angle: "] = self._compute_angle(det, depth_array)
+            det["Vessel side: "] = self._compute_side(det, depth_array)
         return detections
 
-    def _compute_measurement(self, detection, depth_array):
+    def _compute_angle(self, detection, depth_array):
         bbox = detection["bbox"]
-        # TODO: Gelen geminin araca göre olan açısı hesaplanacak.
+        bbox_center_x = (bbox[0] + bbox[2]) / 2
 
-        side = None
+        if self.fx is None:
+            return None
+
+        angle_rad = np.arctan2(bbox_center_x - self.cx, self.fx)
+        angle_deg = np.degrees(angle_rad)
+        return angle_deg
+
+    def _compute_side(self, detection, depth_array):
+        angle_deg = detection.get("Vessel angle: ")
+        if angle_deg is None:
+            angle_deg = self._compute_angle(detection, depth_array)
+
+        if angle_deg is not None:
+            if abs(angle_deg) <= TOLARANCE_DEG:
+                return "across"
+            elif angle_deg > 0:
+                return "right"
+            else:
+                return "left"
+
+        # Fallback
+        bbox = detection["bbox"]
+        bbox_center_x = (bbox[0] + bbox[2]) / 2
+        image_center_x = CAMERA_WIDTH / 2
+
+        tolerance_px = CAMERA_WIDTH * TOLERANCE_RATIO
+
+        diff = bbox_center_x - image_center_x
+
+        if abs(diff) <= tolerance_px:
+            side = "across"
+        elif diff > 0:
+            side = "right"
+        else:
+            side = "left"
+
         return side
