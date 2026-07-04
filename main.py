@@ -4,10 +4,8 @@ import subprocess
 import sys
 import threading
 import time
+
 from config.camera_config import *
-
-import pyzed.sl as sl
-
 from core import data_writer
 from core import shared_state
 from servers import data_server
