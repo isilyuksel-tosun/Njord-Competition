@@ -9,7 +9,7 @@ import pyzed.sl as sl
 # -----------------------------------------------------------------------------
 
 # Resolution
-CAMERA_RESOLUTION = sl.RESOLUTION.HD1080
+CAMERA_RESOLUTION = sl.RESOLUTION.HD720
 
 RESOLUTION_MAP = {
     sl.RESOLUTION.HD2K: (2208, 1242),
@@ -26,7 +26,7 @@ RGB_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 4)
 DEPTH_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH)
 
 # FPS
-CAMERA_FPS = 30
+CAMERA_FPS = 15
 
 # Depth Mode
 DEPTH_MODE = sl.DEPTH_MODE.NEURAL

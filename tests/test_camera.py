@@ -2,72 +2,55 @@ import os
 import sys
 import unittest
 
+import numpy as np
+
 # Testlerin kök dizindeki modülleri görebilmesi için
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-import pyzed.sl as sl
-from main import init_camera
-from core import shared_state
+from config.camera_config import CAMERA_HEIGHT, CAMERA_WIDTH
+from core.shared_frame_source import close_capture_source, open_or_start_capture_source
 
 
 class TestCameraHardware(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Sınıf başlatıldığında (test serisi başlarken) kamerayı sadece BİR KERE açar."""
-        print("\n[TEST] Kamera başlatılıyor (Tek seferlik)...")
+        """Sınıf başlatıldığında frame kaynağına sadece BİR KERE bağlanır."""
+        print("\n[TEST] capture_proc frame kaynağına bağlanılıyor...")
+        cls.frame_source = None
+        cls.capture_process = None
+        cls.capture_stop_event = None
         try:
-            cls.zed = init_camera()
+            cls.frame_source, cls.capture_process, cls.capture_stop_event = open_or_start_capture_source()
         except Exception as e:
-            cls.zed = None
-            print(f"Kamera başlatılamadı: {e}")
+            print(f"capture_proc frame kaynağına bağlanılamadı: {e}")
 
     @classmethod
     def tearDownClass(cls):
-        """Tüm testler bittikten sonra kamerayı kapatır ve paylaşımlı belleği temizler."""
-        if hasattr(cls, 'zed') and cls.zed and cls.zed.is_opened():
-            cls.zed.close()
-            print("\n[TEST] Kamera güvenli bir şekilde kapatıldı.")
-
-        # Olası sızıntıları engellemek için Shared Memory bloklarını yok ediyoruz
-        try:
-            shared_state._rgb_shm.close()
-            shared_state._rgb_shm.unlink()
-            shared_state._depth_shm.close()
-            shared_state._depth_shm.unlink()
-            shared_state._meta_shm.close()
-            shared_state._meta_shm.unlink()
-            print("[TEST] Paylaşımlı bellek (Shared Memory) temizlendi.")
-        except Exception:
-            pass
+        """Tüm testler bittikten sonra yerel capture process başlatıldıysa kapatır."""
+        close_capture_source(cls.frame_source, cls.capture_process, cls.capture_stop_event)
+        print("\n[TEST] capture_proc frame kaynağı güvenli bir şekilde kapatıldı.")
 
     def test_01_initialization(self):
-        """Kameranın başarıyla açıldığını doğrular."""
-        self.assertIsNotNone(self.zed, "init_camera() None döndürdü.")
-        self.assertTrue(self.zed.is_opened(), "Kamera açık değil.")
-        print("\n[TEST - 01] Kamera başarıyla ilklendirildi.")
+        """capture_proc shared memory kaynağına başarıyla bağlanıldığını doğrular."""
+        self.assertIsNotNone(self.frame_source, "capture_proc frame source None döndürdü.")
+        fx, cx = self.frame_source.get_calibration()
+        self.assertGreater(fx, 0.0, "Geçersiz fx kalibrasyonu.")
+        self.assertGreater(cx, 0.0, "Geçersiz cx kalibrasyonu.")
+        print("\n[TEST - 01] capture_proc frame kaynağı başarıyla ilklendirildi.")
 
     def test_02_frame_grab(self):
-        """Kameradan görüntü çekilebildiğini doğrular."""
-        runtime_params = sl.RuntimeParameters()
-        image = sl.Mat()
+        """capture_proc üzerinden görüntü ve depth alınabildiğini doğrular."""
+        frame_data = self.frame_source.read(timeout=3.0)
+        frame = frame_data["frame_bgr"]
+        depth = frame_data["depth"]
 
-        # Kamera ilk açıldığında sensörlerin oturması için ilk birkaç frame boş dönebilir,
-        # bu yüzden grab işlemini birkaç kez deniyoruz.
-        success = False
-        for _ in range(5):
-            if self.zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
-                success = True
-                break
-
-        self.assertTrue(success, "Kameradan frame yakalanamadı (grab hatası).")
-
-        retrieve_status = self.zed.retrieve_image(image, sl.VIEW.LEFT)
-        self.assertEqual(retrieve_status, sl.ERROR_CODE.SUCCESS, "Görüntü çekilemedi.")
-        self.assertTrue(image.is_init(), "Çekilen görüntü boş veya başlatılamadı.")
-        print("\n[TEST - 02] Frame başarıyla yakalandı.")
+        self.assertEqual(frame.shape, (CAMERA_HEIGHT, CAMERA_WIDTH, 3), "RGB frame boyutu hatalı.")
+        self.assertEqual(depth.shape, (CAMERA_HEIGHT, CAMERA_WIDTH), "Depth frame boyutu hatalı.")
+        self.assertTrue(np.any(frame), "RGB frame boş görünüyor.")
+        print("\n[TEST - 02] Frame capture_proc üzerinden başarıyla yakalandı.")
 
 
 if __name__ == '__main__':

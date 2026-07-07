@@ -1,5 +1,5 @@
 """
-    python3 test_vision_live_vessel.py --device cuda
+    python3 tests/test_angle.py --device cuda
 """
 import argparse
 import json
@@ -20,17 +20,18 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)  # insert(0, ...) is safer than append
 
 from config.camera_config import *
-from config.vision_config import VESSEL_MODEL_PATH
-from vision.detector import VesselDetector
+from config.vision_config import *
+from core.shared_frame_source import close_capture_source, open_or_start_capture_source
+from vision.detector import BuoyDetector
 
 # ---------------- Settings ----------------
 LOG_INTERVAL_SEC = 2.0  # Terminal reporting interval (seconds)
 MAX_DEPTH_M = 40.0
 
 # JSON log settings
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "vessel")
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "angle")
 SESSION_START_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_FILE_PATH = os.path.join(LOG_DIR, f"vessel_log_{SESSION_START_TS}.json")
+LOG_FILE_PATH = os.path.join(LOG_DIR, f"angle_log_{SESSION_START_TS}.json")
 
 # In-memory log accumulator (not written to disk during loop)
 session_log_entries = []
@@ -173,11 +174,13 @@ def save_session_log():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="VesselDetector live ZED2i test")
+    parser = argparse.ArgumentParser(description="Angle Detector live ZED2i test")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"],
                         help="Device to run the model on (default: cpu)")
     parser.add_argument("--headless", action="store_true",
                         help="Run without opening a cv2 window, using terminal logs only")
+    parser.add_argument("--no-log", action="store_true",
+                        help="Disables JSON logging and memory accumulation for lightweight testing")
     return parser.parse_args()
 
 
@@ -185,77 +188,57 @@ def parse_args():
 def main():
     global is_running
     args = parse_args()
+    frame_source = None
+    capture_process = None
+    capture_stop_event = None
 
     start_gpu_monitor()
 
-    print(f"[INFO] Initializing ZED Camera... (Target Resolution reference: {CAMERA_WIDTH}x{CAMERA_HEIGHT})")
-    zed = sl.Camera()
-    init_params = sl.InitParameters()
-
-    init_params.camera_resolution = CAMERA_RESOLUTION
-    init_params.camera_fps = CAMERA_FPS
-    init_params.depth_mode = DEPTH_MODE
-    init_params.coordinate_units = COORDINATE_UNITS
-    init_params.depth_minimum_distance = 0.3
-
-    status = zed.open(init_params)
-    if status != sl.ERROR_CODE.SUCCESS:
-        raise RuntimeError(f"Failed to open ZED: {status}")
-
-    # Break the speed lock with fixed exposure/gain (same logic as ref. script)
-    zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)
-    zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 20)
-    zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 50)
-
-    # Calibration (fx/cx) can ONLY be read after the camera is opened.
-    # We pass these to VesselDetector's constructor so it can calculate angles.
-    cam_info = zed.get_camera_information()
-    calib = cam_info.camera_configuration.calibration_parameters.left_cam
-    FX, CX = calib.fx, calib.cx
-    print(f"[INFO] Calibration read: fx={FX:.2f}, cx={CX:.2f}")
-
-    runtime_params = sl.RuntimeParameters()
-    image_zed = sl.Mat()
-    depth_zed = sl.Mat()
-
-    print(f"[INFO] Loading VesselDetector: {VESSEL_MODEL_PATH} (device={args.device})")
-    detector = VesselDetector(model_path=VESSEL_MODEL_PATH, device=args.device, fx=FX, cx=CX)
-    if detector.model is None:
-        raise RuntimeError("Failed to load VesselDetector model.")
-
-    print(f"[INFO] Classes: {detector.class_names}")
-
-    # Vertical reference line at image center (to visually verify right/left/across distinction)
-    image_center_x = CAMERA_WIDTH // 2
-
-    last_log_time = time.time()
-    frames_since_last_log = 0
-
-    print(f"\n[INFO] Process started. Status will be reported every {LOG_INTERVAL_SEC} seconds.")
-    print(f"[INFO] Logs will be kept in memory only, and written at once to '{LOG_FILE_PATH}' on exit.")
-    print("[INFO] Press Ctrl+C in the terminal to stop.\n")
-
-    if not args.headless:
-        cv2.namedWindow("VesselDetector - Live Test", cv2.WINDOW_NORMAL)
-
     try:
+        print(f"[INFO] Connecting to capture_proc shared frames... ({CAMERA_WIDTH}x{CAMERA_HEIGHT})")
+        frame_source, capture_process, capture_stop_event = open_or_start_capture_source()
+
+        # Camera settings belong in capture_proc; tests only consume shared frames.
+
+        FX, CX = frame_source.get_calibration()
+        print(f"[INFO] Calibration read from capture_proc: fx={FX:.2f}, cx={CX:.2f}")
+
+        print(f"[INFO] Loading BuoyDetector: {BUOY_MODEL_PATH} (device={args.device})")
+        detector = BuoyDetector(model_path=BUOY_MODEL_PATH, device=args.device, fx=FX, cx=CX)
+        if detector.model is None:
+            raise RuntimeError("Failed to load BuoyDetector model.")
+
+        print(f"[INFO] Classes: {detector.class_names}")
+
+        # Vertical reference line at image center (to visually verify right/left/across distinction)
+        image_center_x = CAMERA_WIDTH // 2
+
+        last_log_time = time.time()
+        frames_since_last_log = 0
+
+        print(f"\n[INFO] Process started. Status will be reported every {LOG_INTERVAL_SEC} seconds.")
+        print(f"[INFO] Logs will be kept in memory only, and written at once to '{LOG_FILE_PATH}' on exit.")
+        print("[INFO] Press Ctrl+C in the terminal to stop.\n")
+
+        if not args.headless:
+            cv2.namedWindow("Angle Detector - Live Test", cv2.WINDOW_NORMAL)
+
         while is_running:
             t_loop_start = time.time()
 
-            if zed.grab(runtime_params) != sl.ERROR_CODE.SUCCESS:
+            try:
+                frame_data = frame_source.read(timeout=1.0)
+            except TimeoutError:
                 continue
             t_grab = time.time()
 
             current_time = time.time()
             frames_since_last_log += 1
 
-            zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-            zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
             t_retrieve = time.time()
 
-            bgra_data = image_zed.get_data()
-            frame = cv2.cvtColor(bgra_data, cv2.COLOR_BGRA2BGR)
-            depth_map = depth_zed.get_data()
+            frame = frame_data["frame_bgr"]
+            depth_map = frame_data["depth"]
             t_convert = time.time()
 
             detections = detector.detect(frame, depth_map)
@@ -273,8 +256,8 @@ def main():
                 conf = det.get("confidence", 0.0)
                 distance = det.get("distance", None)
                 bbox = det.get("bbox", None)
-                side = det.get("Vessel side: ", "?")
-                angle = det.get("Vessel angle: ", None)
+                side = det.get("Buoy side: ", "?")
+                angle = det.get("Buoy angle: ", None)
 
                 distance_text = f"{distance:.2f}m" if distance is not None else "N/A"
                 angle_text = f"{angle:.1f}°" if angle is not None else "N/A"
@@ -327,20 +310,21 @@ def main():
                 print("-" * 35)
 
                 # Only added to memory -- NOT WRITTEN to disk (no CPU/disk load).
-                session_log_entries.append({
-                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-                    "fps": round(fps, 2),
-                    "cpu_percent": cpu_usage,
-                    "ram_percent": ram_usage,
-                    "gpu": gpu_info,
-                    "detections": detected_objects_struct,
-                })
+                if not args.no_log:
+                    session_log_entries.append({
+                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+                        "fps": round(fps, 2),
+                        "cpu_percent": cpu_usage,
+                        "ram_percent": ram_usage,
+                        "gpu": gpu_info,
+                        "detections": detected_objects_struct,
+                    })
 
                 last_log_time = current_time
                 frames_since_last_log = 0
 
             if not args.headless:
-                cv2.imshow("VesselDetector - Live Test", frame)
+                cv2.imshow("Angle Detector - Live Test", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     is_running = False
@@ -369,7 +353,7 @@ def main():
                 _tegrastats_proc.terminate()
             except Exception:
                 pass
-        zed.close()
+        close_capture_source(frame_source, capture_process, capture_stop_event)
         if not args.headless:
             cv2.destroyAllWindows()
         save_session_log()
