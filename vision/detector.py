@@ -50,9 +50,61 @@ class BaseYOLODetector:
         return detections
 
 
+def _normalize_intrinsics(fx, cx):
+    return fx, cx if cx is not None else CAMERA_WIDTH / 2
+
+
+def _compute_angle_from_bbox(detection, fx, cx):
+    if fx is None:
+        return None
+
+    bbox = detection["bbox"]
+    bbox_center_x = (bbox[0] + bbox[2]) / 2
+    angle_rad = np.arctan2(bbox_center_x - cx, fx)
+    return float(np.degrees(angle_rad))
+
+
+def _compute_side_from_bbox(detection, angle_deg):
+    if angle_deg is not None:
+        if abs(angle_deg) <= TOLARANCE_DEG:
+            return "across"
+        if angle_deg > 0:
+            return "right"
+        return "left"
+
+    bbox = detection["bbox"]
+    bbox_center_x = (bbox[0] + bbox[2]) / 2
+    image_center_x = CAMERA_WIDTH / 2
+    tolerance_px = CAMERA_WIDTH * TOLERANCE_RATIO
+    diff = bbox_center_x - image_center_x
+
+    if abs(diff) <= tolerance_px:
+        return "across"
+    if diff > 0:
+        return "right"
+    return "left"
+
+
+def _add_angle_fields(detections, label, fx, cx):
+    angle_key = f"{label} angle: "
+    side_key = f"{label} side: "
+
+    for det in detections:
+        angle_deg = _compute_angle_from_bbox(det, fx, cx)
+        det[angle_key] = angle_deg
+        det[side_key] = _compute_side_from_bbox(det, angle_deg)
+
+    return detections
+
+
 class BuoyDetector(BaseYOLODetector):
-    def __init__(self, model_path=BUOY_MODEL_PATH, device=DEVICE):
+    def __init__(self, model_path=BUOY_MODEL_PATH, device=DEVICE, fx=None, cx=None):
         super().__init__(model_path, device)
+        self.fx, self.cx = _normalize_intrinsics(fx, cx)
+
+    def detect(self, bgr_image, depth_array):
+        detections = super().detect(bgr_image, depth_array)
+        return _add_angle_fields(detections, "Buoy", self.fx, self.cx)
 
 
 class VesselDetector(BaseYOLODetector):
@@ -60,55 +112,9 @@ class VesselDetector(BaseYOLODetector):
         super().__init__(model_path, device)
         # ZED kalibrasyonundan gelen intrinsics. Kamera açıldıktan sonra
         # zed.get_camera_information() ile okunup buraya geçirilmeli.
-        # fx=None kalırsa _compute_angle güvenli bir fallback kullanır.
-        self.fx = fx
-        self.cx = cx if cx is not None else CAMERA_WIDTH / 2
+        # fx=None kalırsa side hesabı görüntü merkezi fallback'ini kullanır.
+        self.fx, self.cx = _normalize_intrinsics(fx, cx)
 
     def detect(self, bgr_image, depth_array):
         detections = super().detect(bgr_image, depth_array)
-        for det in detections:
-            det["Vessel angle: "] = self._compute_angle(det, depth_array)
-            det["Vessel side: "] = self._compute_side(det, depth_array)
-        return detections
-
-    def _compute_angle(self, detection, depth_array):
-        bbox = detection["bbox"]
-        bbox_center_x = (bbox[0] + bbox[2]) / 2
-
-        if self.fx is None:
-            return None
-
-        angle_rad = np.arctan2(bbox_center_x - self.cx, self.fx)
-        angle_deg = np.degrees(angle_rad)
-        return angle_deg
-
-    def _compute_side(self, detection, depth_array):
-        angle_deg = detection.get("Vessel angle: ")
-        if angle_deg is None:
-            angle_deg = self._compute_angle(detection, depth_array)
-
-        if angle_deg is not None:
-            if abs(angle_deg) <= TOLARANCE_DEG:
-                return "across"
-            elif angle_deg > 0:
-                return "right"
-            else:
-                return "left"
-
-        # Fallback
-        bbox = detection["bbox"]
-        bbox_center_x = (bbox[0] + bbox[2]) / 2
-        image_center_x = CAMERA_WIDTH / 2
-
-        tolerance_px = CAMERA_WIDTH * TOLERANCE_RATIO
-
-        diff = bbox_center_x - image_center_x
-
-        if abs(diff) <= tolerance_px:
-            side = "across"
-        elif diff > 0:
-            side = "right"
-        else:
-            side = "left"
-
-        return side
+        return _add_angle_fields(detections, "Vessel", self.fx, self.cx)

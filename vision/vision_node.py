@@ -1,3 +1,4 @@
+import argparse
 import json
 import time
 from multiprocessing import shared_memory
@@ -7,8 +8,9 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from config.camera_config import RGB_SHAPE, DEPTH_SHAPE
+from config.camera_config import DEPTH_SHAPE, RGB_SHAPE
 from config.vision_config import BUOY_MODEL_PATH, VESSEL_MODEL_PATH
+from core import shared_state
 from vision.detector import BuoyDetector, VesselDetector
 
 TASK_DETECTOR_MAP = {
@@ -24,18 +26,20 @@ DETECTOR_REGISTRY = {
 
 
 class VisionNode(Node):
-    def __init__(self):
+    def __init__(self, fx=None, cx=None):
         super().__init__('vision_node')
 
         self.detectors = {}  # name -> instance
         self.current_task = None
+        self.fx = fx
+        self.cx = cx
 
-        self.rgb_shm = self._attach_with_retry("RGB_DATA")
-        self.depth_shm = self._attach_with_retry("DEPTH_DATA")
-        self.meta_shm = self._attach_with_retry("ZED_META")
+        self.rgb_shm = self._attach_with_retry(shared_state.RGB_SHM_NAME)
+        self.depth_shm = self._attach_with_retry(shared_state.DEPTH_SHM_NAME)
+        self.meta_shm = self._attach_with_retry(shared_state.META_SHM_NAME)
         self.rgb = np.ndarray(RGB_SHAPE, dtype=np.uint8, buffer=self.rgb_shm.buf)
         self.depth = np.ndarray(DEPTH_SHAPE, dtype=np.float32, buffer=self.depth_shm.buf)
-        self.meta = np.ndarray((2,), dtype=np.int64, buffer=self.meta_shm.buf)
+        self.meta = np.ndarray(shared_state.META_SHAPE, dtype=np.int64, buffer=self.meta_shm.buf)
 
         self.last_frame_id = -1
         self.pub = self.create_publisher(String, '/vision/detections', 10)
@@ -66,7 +70,10 @@ class VisionNode(Node):
             if name not in self.detectors:
                 cls, model_path = DETECTOR_REGISTRY[name]
                 self.get_logger().info(f"Loading '{name}' detector...")
-                self.detectors[name] = cls(model_path=model_path)
+                if name == "vessel":
+                    self.detectors[name] = cls(model_path=model_path, fx=self.fx, cx=self.cx)
+                else:
+                    self.detectors[name] = cls(model_path=model_path)
 
         try:
             import torch
@@ -111,8 +118,13 @@ class VisionNode(Node):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fx", type=float, default=None)
+    parser.add_argument("--cx", type=float, default=None)
+    args = parser.parse_args()
+
     rclpy.init()
-    node = VisionNode()
+    node = VisionNode(fx=args.fx, cx=args.cx)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
