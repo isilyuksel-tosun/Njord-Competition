@@ -13,6 +13,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from pymavlink import mavutil
+from jetson_backend.njord_bridge_http_backend import attach_http_backend
 
 from sensor_msgs.msg import Imu, NavSatFix, BatteryState
 from std_msgs.msg import String, Float32
@@ -124,6 +125,8 @@ class OrangeCubeBridgeNode(Node):
         self.create_timer(0.1, self._send_rc_override_loop)
         self.create_timer(1.0, self._connection_watchdog)
 
+        attach_http_backend(self, host="0.0.0.0", port=8000)
+        
         self.get_logger().info("/cube topic ve servisleri aktif.")
 
     def _publish_error(self, text):
@@ -363,7 +366,17 @@ class OrangeCubeBridgeNode(Node):
                         self.current_a = msg.current_battery / 100.0
                     if msg.battery_remaining != -1:
                         self.battery_remaining = float(msg.battery_remaining)
-
+                elif msg_type in (
+                    "MISSION_COUNT",
+                    "MISSION_ITEM",
+                    "MISSION_ITEM_INT",
+                    "MISSION_REQUEST",
+                    "MISSION_REQUEST_INT",
+                    "MISSION_ACK",
+                ):
+                     if hasattr(self, "http_backend_push_mission_message"):
+                        self.http_backend_push_mission_message(msg)
+               
             except Exception as exc:
                 self._publish_error(f"MAVLink okuma hatasi: {exc}")
                 self.connected = False
