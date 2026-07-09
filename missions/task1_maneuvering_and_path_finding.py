@@ -34,6 +34,7 @@ AVOID_FORWARD_DIST_M = 5.0  # Geçici WP ana rota doğrultusunda kaç metre iler
 AVOID_SIDE_DIST_M = 3.0  # Geçici WP sağ/sol kaç metre yanda olacak
 AVOID_WAYPOINT_TOLERANCE_M = 1.0  # Geçici WP'ye varış toleransı
 EARTH_RADIUS_M = 6378137.0
+MIN_VALID_ABS_COORD = 1e-6
 
 
 class MissionState(Enum):
@@ -397,12 +398,23 @@ class Task1Node(Node):
 
         # Anlık Yönelim Değişkeni (GPS Callback'e aktarmak için)
         self.current_heading = 0.0
+        self.bridge_connected = False
+        self.mission_active = False
+        self.valid_gps_received = False
 
         # 4. Ana Kontrol Döngüsünü Başlat (Saniyede 10 kez çalışır: 0.1 sn)
         self.control_timer = self.create_timer(0.1, self.timer_callback)
 
     def gps_callback(self, msg):
         """Araçtan gelen NavSatFix verisini dinler."""
+        if abs(msg.latitude) < MIN_VALID_ABS_COORD and abs(msg.longitude) < MIN_VALID_ABS_COORD:
+            self.get_logger().warn(
+                "Gecersiz GPS (0,0) yok sayiliyor.",
+                throttle_duration_sec=2.0
+            )
+            return
+
+        self.valid_gps_received = True
         self.task.update_gps(msg.latitude, msg.longitude, self.current_heading)
 
     def heading_callback(self, msg):
@@ -412,7 +424,37 @@ class Task1Node(Node):
 
     def state_callback(self, msg):
         """Bridge'den gelen durum mesajlarını dinler (Gerekirse kullanılır)."""
-        pass
+        self.bridge_connected = "connected=True" in msg.data
+
+    def wait_for_bridge_connection(self, timeout_sec=30.0):
+        """Bridge servisleri hazir olsa bile MAVLink heartbeat gelene kadar bekler."""
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self.bridge_connected:
+                return True
+
+            self.get_logger().info(
+                "Bridge MAVLink baglantisi bekleniyor...",
+                throttle_duration_sec=2.0
+            )
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        return False
+
+    def wait_for_valid_gps(self, timeout_sec=30.0):
+        """Mission ARM olmadan once gercek GPS konumu bekler."""
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and time.monotonic() < deadline:
+            if self.valid_gps_received:
+                return True
+
+            self.get_logger().info(
+                "Gecerli GPS konumu bekleniyor...",
+                throttle_duration_sec=2.0
+            )
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        return False
 
     def timer_callback(self):
         """Görev mantığını sürekli tetikler.
@@ -425,6 +467,9 @@ class Task1Node(Node):
         # TODO: ZED kamerasından gelen tespitler (detections) buraya aktarılacak.
         # Şimdilik boş liste -> kaçınma path'i gerçek suda hiç test edilmemiş demektir,
         # entegre edilmeden kaçınma mantığına güvenilmemeli.
+        if not self.mission_active:
+            return
+
         current_detections = []
 
         try:
@@ -447,6 +492,14 @@ def main(args=None):
     node = Task1Node()
 
     try:
+        if not node.wait_for_bridge_connection(timeout_sec=30.0):
+            node.get_logger().error("Bridge MAVLink baglantisi hazir degil! Mission not starting.")
+            return
+
+        if not node.wait_for_valid_gps(timeout_sec=30.0):
+            node.get_logger().error("Gecerli GPS konumu yok! Mission not starting.")
+            return
+
         node.get_logger().info("Setting vehicle to MANUAL mode...")
         mode_ok = call_set_mode(node, node.mission_clients.set_mode_client, "MANUAL")
         if mode_ok is False:
@@ -459,11 +512,13 @@ def main(args=None):
             node.get_logger().error("ARM failed! Mission not starting.")
             return
 
+        node.mission_active = True
         node.get_logger().info("Mission loop started.")
 
         while rclpy.ok() and not node.task.finished and node.task.state != MissionState.FAILSAFE:
             rclpy.spin_once(node, timeout_sec=0.1)
 
+        node.mission_active = False
         if node.task.state == MissionState.FAILSAFE:
             node.get_logger().error("Mission terminated due to FAILSAFE.")
         else:
@@ -476,6 +531,7 @@ def main(args=None):
 
     except KeyboardInterrupt:
         node.get_logger().info("Mission terminated manually.")
+        node.mission_active = False
         stop_vehicle(node.mission_topics.cmd_vel_pub)
         try:
             call_trigger_service(node, node.mission_clients.disarm_client, "DISARM")

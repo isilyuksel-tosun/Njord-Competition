@@ -1,11 +1,14 @@
 import os
 import queue
 import shlex
+import signal
 import subprocess
 import sys
 import threading
 import time
 from multiprocessing import get_context
+
+from Cython.Includes.posix.unistd import sleep
 
 from core import capture_proc
 from core import data_writer
@@ -13,6 +16,52 @@ from servers import data_server
 from servers import video_server
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def launch_child_process(command):
+    return subprocess.Popen(
+        command,
+        shell=True,
+        executable="/bin/bash",
+        start_new_session=True,
+    )
+
+
+def signal_child_process(process, sig):
+    if process is None or process.poll() is not None:
+        return
+
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return
+    except AttributeError:
+        process.send_signal(sig)
+
+
+def stop_child_process(name, process, timeout_sec=5.0, sig=signal.SIGINT):
+    if process is None or process.poll() is not None:
+        return
+
+    print(f"[SYSTEM] Stopping {name}...")
+    signal_child_process(process, sig)
+
+    try:
+        process.wait(timeout=timeout_sec)
+        return
+    except subprocess.TimeoutExpired:
+        print(f"[SYSTEM] {name} did not stop in time, sending SIGTERM...")
+
+    signal_child_process(process, signal.SIGTERM)
+
+    try:
+        process.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        print(f"[SYSTEM] {name} did not stop after SIGTERM, sending SIGKILL...")
+
+    signal_child_process(process, getattr(signal, "SIGKILL", signal.SIGTERM))
+    process.wait(timeout=2)
 
 
 def start_capture_process():
@@ -63,7 +112,9 @@ if __name__ == "__main__":
     capture_stop_event = None
     frame_lock = None
     frame_ready_event = None
-    child_processes = []
+    p_bridge = None
+    p_vision = None
+    p_njord_task1 = None
 
     try:
         (
@@ -127,12 +178,10 @@ if __name__ == "__main__":
         # )
         ################################################################################################################
 
-        p_bridge = subprocess.Popen(cmd_bridge, shell=True, executable="/bin/bash")
-        child_processes.append(p_bridge)
+        p_bridge = launch_child_process(cmd_bridge)
         print(f" -> Bridge Node launched (PID: {p_bridge.pid})")
 
-        p_vision = subprocess.Popen(cmd_vision, shell=True, executable="/bin/bash")
-        child_processes.append(p_vision)
+        p_vision = launch_child_process(cmd_vision)
         print(f" -> Vision Node launched (PID: {p_vision.pid})")
 
         time.sleep(2)
@@ -140,8 +189,7 @@ if __name__ == "__main__":
         ################################################################################################################
         #   NJORD MISSION START CMD
         ################################################################################################################
-        p_njord_task1 = subprocess.Popen(cmd_njord_task1, shell=True, executable="/bin/bash")
-        child_processes.append(p_njord_task1)
+        p_njord_task1 = launch_child_process(cmd_njord_task1)
         print(f" -> NJORD Mission 1 Node launched (PID: {p_njord_task1.pid})\n")
 
         # p_njord_task2 = subprocess.Popen(cmd_njord_task2, shell=True, executable="/bin/bash")
@@ -165,12 +213,12 @@ if __name__ == "__main__":
     finally:
         print("[SYSTEM] Cleaning process was started...")
 
-        for p in child_processes:
-            try:
-                p.terminate()
-                p.wait(timeout=2)
-            except Exception as exc:
-                print(f"[SYSTEM] Error while sub-process shut down: {exc}")
+        try:
+            stop_child_process("NJORD Mission 1 Node", p_njord_task1, timeout_sec=7.0)
+            stop_child_process("Vision Node", p_vision, timeout_sec=3.0)
+            stop_child_process("Bridge Node", p_bridge, timeout_sec=5.0)
+        except Exception as exc:
+            print(f"[SYSTEM] Error while sub-process shut down: {exc}")
 
         print("[SYSTEM] Sub-processes closed.")
 
