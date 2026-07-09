@@ -32,6 +32,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pymavlink import mavutil
 
+ARDUPILOT_FORCE_ARM_MAGIC = 21196
+
 
 def parse_waypoints_from_text(text):
     waypoints = []
@@ -311,12 +313,36 @@ class MissionBackend:
 
     def set_arm(self, payload):
         armed = bool(payload.get("armed", True))
-        success = self.node._arm_disarm(armed)
+        force = bool(payload.get("force", payload.get("force_arm", armed)))
+        if force and armed:
+            success = self._force_arm()
+        else:
+            success = self.node._arm_disarm(armed)
         return {
             "ok": bool(success),
             "success": bool(success),
-            "message": "ARM command sent." if armed else "DISARM command sent.",
+            "message": "FORCE ARM command sent." if armed and force else ("ARM command sent." if armed else "DISARM command sent."),
         }
+
+    def _force_arm(self):
+        master = self._master()
+        target_system, target_component = self._targets()
+        for _ in range(3):
+            master.mav.command_long_send(
+                target_system,
+                target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0,
+                1.0,
+                float(ARDUPILOT_FORCE_ARM_MAGIC),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            time.sleep(0.15)
+        return True
 
     def set_mode(self, payload):
         mode = str(payload.get("mode") or payload.get("custom_mode") or "AUTO").upper()
