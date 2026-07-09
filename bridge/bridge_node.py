@@ -55,17 +55,40 @@ class OrangeCubeBridgeNode(Node):
             "heartbeat_timeout",
             int(os.getenv("MAVLINK_HEARTBEAT_TIMEOUT", str(DEFAULT_HEARTBEAT_TIMEOUT))),
         )
+        self.declare_parameter(
+            "connection_timeout_sec",
+            float(os.getenv("MAVLINK_CONNECTION_TIMEOUT", "5.0")),
+        )
+        self.declare_parameter(
+            "reconnect_interval_sec",
+            float(os.getenv("MAVLINK_RECONNECT_INTERVAL", "3.0")),
+        )
+        self.declare_parameter(
+            "reconnect_heartbeat_timeout",
+            float(os.getenv("MAVLINK_RECONNECT_HEARTBEAT_TIMEOUT", "3.0")),
+        )
+        self.declare_parameter(
+            "disarm_on_shutdown",
+            os.getenv("MAVLINK_DISARM_ON_SHUTDOWN", "1").lower()
+            not in ("0", "false", "no", "off"),
+        )
 
         self.connection_string = self.get_parameter("connection_string").value
         self.baud = int(self.get_parameter("baud").value)
         self.heartbeat_timeout = int(self.get_parameter("heartbeat_timeout").value)
+        self.connection_timeout_sec = float(self.get_parameter("connection_timeout_sec").value)
+        self.reconnect_interval_sec = float(self.get_parameter("reconnect_interval_sec").value)
+        self.reconnect_heartbeat_timeout = float(
+            self.get_parameter("reconnect_heartbeat_timeout").value
+        )
+        self.disarm_on_shutdown = bool(self.get_parameter("disarm_on_shutdown").value)
 
         self.master = None
         self.connected = False
         self.armed = False
         self.mode = "UNKNOWN"
         self.last_heartbeat_time = 0.0
-        self.connection_timeout_sec = 3.0
+        self.last_connection_attempt = 0.0
         self.connection_lost_reported = False
         self.cmd_vel_ignored_reported = False
 
@@ -110,7 +133,9 @@ class OrangeCubeBridgeNode(Node):
         self.get_logger().error(str(text))
 
     def _connect(self):
+        self.last_connection_attempt = time.time()
         try:
+            self._close_master()
             self.master = connect_mavlink(
                 connection_string=self.connection_string,
                 baud=self.baud,
@@ -121,9 +146,135 @@ class OrangeCubeBridgeNode(Node):
             self.last_heartbeat_time = time.time()
             self.connection_lost_reported = False
             self.cmd_vel_ignored_reported = False
+            self._request_data_streams()
         except Exception as exc:
             self.connected = False
+            self.master = None
+            self.last_heartbeat_time = 0.0
+            self._reset_vehicle_state()
+            self._neutralize_outputs()
             self._publish_error(f"MAVLink baglanti hatasi: {exc}")
+
+    def _neutralize_outputs(self):
+        self.last_steering_pwm = 1500
+        self.last_throttle_pwm = 1500
+        self.last_cmd_vel_time = 0.0
+
+    def _reset_vehicle_state(self):
+        self.armed = False
+        self.mode = "UNKNOWN"
+        self.gps_lat = None
+        self.gps_lon = None
+        self.gps_alt = None
+        self.relative_alt = None
+        self.heading_deg = None
+        self.roll = None
+        self.pitch = None
+        self.yaw = None
+        self.voltage_v = None
+        self.current_a = None
+        self.battery_remaining = None
+
+    def _close_master(self):
+        if self.master is None:
+            return
+        try:
+            self.master.close()
+        except Exception:
+            pass
+        finally:
+            self.master = None
+
+    def _has_valid_link(self):
+        return (
+                self.master is not None
+                and self.connected
+                and self.master.target_system not in (None, 0)
+                and self.master.target_component not in (None, 0)
+        )
+
+    def _has_valid_gps(self):
+        if self.gps_lat is None or self.gps_lon is None:
+            return False
+        return abs(self.gps_lat) > 1e-6 or abs(self.gps_lon) > 1e-6
+
+    def _message_from_target(self, msg):
+        if self.master is None or self.master.target_system in (None, 0):
+            return False
+        if not hasattr(msg, "get_srcSystem"):
+            return True
+        if msg.get_srcSystem() != self.master.target_system:
+            return False
+        if not hasattr(msg, "get_srcComponent"):
+            return True
+        return msg.get_srcComponent() == self.master.target_component
+
+    def _try_reconnect(self):
+        now = time.time()
+        if now - self.last_connection_attempt < self.reconnect_interval_sec:
+            return
+
+        self.last_connection_attempt = now
+        self.get_logger().info("MAVLink yeniden baglanti deneniyor...")
+        try:
+            self._close_master()
+            self.master = connect_mavlink(
+                connection_string=self.connection_string,
+                baud=self.baud,
+                heartbeat_timeout=self.reconnect_heartbeat_timeout,
+                logger=self.get_logger(),
+            )
+            self.connected = True
+            self.last_heartbeat_time = time.time()
+            self.connection_lost_reported = False
+            self.cmd_vel_ignored_reported = False
+            self._request_data_streams()
+            self.get_logger().info("MAVLink yeniden baglandi.")
+        except Exception as exc:
+            self.connected = False
+            self.master = None
+            self.last_heartbeat_time = 0.0
+            self._reset_vehicle_state()
+            self._neutralize_outputs()
+            if not self.connection_lost_reported:
+                self.connection_lost_reported = True
+                self._publish_error(f"MAVLink yeniden baglanti basarisiz: {exc}")
+
+    def _request_message_interval(self, message_id, frequency_hz):
+        if not self._has_valid_link():
+            return
+
+        interval_us = int(1_000_000 / frequency_hz) if frequency_hz > 0 else -1
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            message_id,
+            interval_us,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+    def _request_data_streams(self):
+        if not self._has_valid_link():
+            return
+
+        requested_messages = (
+            (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 5),
+            (mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 10),
+            (mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, 5),
+            (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 1),
+        )
+
+        for message_id, frequency_hz in requested_messages:
+            try:
+                self._request_message_interval(message_id, frequency_hz)
+            except Exception as exc:
+                self.get_logger().warn(f"Telemetry istegi gonderilemedi: {exc}")
 
     def _connection_watchdog(self):
         if self.master is None:
@@ -131,9 +282,11 @@ class OrangeCubeBridgeNode(Node):
             if not self.connection_lost_reported:
                 self.connection_lost_reported = True
                 self.get_logger().warn("MAVLink baglantisi yok: master None")
+            self._try_reconnect()
             return
 
         if self.last_heartbeat_time == 0.0:
+            self._try_reconnect()
             return
 
         elapsed = time.time() - self.last_heartbeat_time
@@ -141,16 +294,23 @@ class OrangeCubeBridgeNode(Node):
             return
 
         self.connected = False
-        if self.connection_lost_reported:
-            return
+        self._reset_vehicle_state()
+        self._neutralize_outputs()
+        if not self.connection_lost_reported:
+            self.connection_lost_reported = True
+            self._publish_error(
+                f"MAVLink heartbeat kesildi. Son heartbeat {elapsed:.1f} saniye once alindi."
+            )
+        self._try_reconnect()
 
-        self.connection_lost_reported = True
-        self.last_steering_pwm = 1500
-        self.last_throttle_pwm = 1500
-        self.last_cmd_vel_time = 0.0
-        self._publish_error(
-            f"MAVLink heartbeat kesildi. Son heartbeat {elapsed:.1f} saniye once alindi."
+    def _reject_without_link(self, action_name):
+        if self._has_valid_link():
+            return False
+
+        self.get_logger().warn(
+            f"{action_name} reddedildi: MAVLink baglantisi hazir degil."
         )
+        return True
 
     def _read_mavlink_messages(self):
         if self.master is None:
@@ -164,6 +324,8 @@ class OrangeCubeBridgeNode(Node):
 
                 msg_type = msg.get_type()
                 if msg_type == "BAD_DATA":
+                    continue
+                if not self._message_from_target(msg):
                     continue
 
                 if msg_type == "HEARTBEAT":
@@ -204,12 +366,17 @@ class OrangeCubeBridgeNode(Node):
 
             except Exception as exc:
                 self._publish_error(f"MAVLink okuma hatasi: {exc}")
+                self.connected = False
+                self._reset_vehicle_state()
+                self._neutralize_outputs()
+                self._close_master()
                 return
 
     def _publish_telemetry(self):
         now = self.get_clock().now().to_msg()
+        link_ready = self._has_valid_link()
 
-        if self.gps_lat is not None and self.gps_lon is not None:
+        if link_ready and self._has_valid_gps():
             gps_msg = NavSatFix()
             gps_msg.header.stamp = now
             gps_msg.header.frame_id = "gps"
@@ -218,17 +385,17 @@ class OrangeCubeBridgeNode(Node):
             gps_msg.altitude = float(self.gps_alt) if self.gps_alt is not None else 0.0
             self.topics.gps_pub.publish(gps_msg)
 
-        if self.heading_deg is not None:
+        if link_ready and self.heading_deg is not None:
             heading_msg = Float32()
             heading_msg.data = float(self.heading_deg)
             self.topics.gps_heading_pub.publish(heading_msg)
 
-        if self.relative_alt is not None:
+        if link_ready and self.relative_alt is not None:
             alt_msg = Float32()
             alt_msg.data = float(self.relative_alt)
             self.topics.relative_alt_pub.publish(alt_msg)
 
-        if self.roll is not None and self.pitch is not None and self.yaw is not None:
+        if link_ready and self.roll is not None and self.pitch is not None and self.yaw is not None:
             imu_msg = Imu()
             imu_msg.header.stamp = now
             imu_msg.header.frame_id = "base_link"
@@ -239,7 +406,7 @@ class OrangeCubeBridgeNode(Node):
             imu_msg.orientation.w = qw
             self.topics.imu_pub.publish(imu_msg)
 
-        if self.voltage_v is not None:
+        if link_ready and self.voltage_v is not None:
             battery_msg = BatteryState()
             battery_msg.header.stamp = now
             battery_msg.voltage = float(self.voltage_v)
@@ -256,7 +423,7 @@ class OrangeCubeBridgeNode(Node):
         self.topics.state_pub.publish(state_msg)
 
     def _set_mode_callback(self, request, response):
-        if self.master is None:
+        if self._reject_without_link("Mod komutu"):
             response.mode_sent = False
             return response
 
@@ -294,7 +461,7 @@ class OrangeCubeBridgeNode(Node):
         return response
 
     def _arm_disarm(self, arm):
-        if self.master is None:
+        if self._reject_without_link("ARM/DISARM komutu"):
             return False
 
         try:
@@ -317,11 +484,95 @@ class OrangeCubeBridgeNode(Node):
             self._publish_error(f"ARM/DISARM hatasi: {exc}")
             return False
 
+    def _send_neutral_rc_override(self):
+        if not self._has_valid_link():
+            return
+
+        self.master.mav.rc_channels_override_send(
+            self.master.target_system,
+            self.master.target_component,
+            1500,
+            0,
+            1500,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+    def _release_rc_override(self):
+        if not self._has_valid_link():
+            return
+
+        self.master.mav.rc_channels_override_send(
+            self.master.target_system,
+            self.master.target_component,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+    def shutdown_vehicle(self):
+        if not self.disarm_on_shutdown:
+            return
+        if not self._has_valid_link():
+            self.get_logger().warn("Shutdown DISARM atlandi: MAVLink baglantisi hazir degil.")
+            return
+
+        self.get_logger().info("Shutdown: arac durduruluyor ve DISARM deneniyor...")
+        self._neutralize_outputs()
+
+        try:
+            for _ in range(3):
+                self._send_neutral_rc_override()
+                self.master.mav.command_long_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                time.sleep(0.15)
+
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                msg = self.master.recv_match(
+                    type="HEARTBEAT",
+                    blocking=True,
+                    timeout=0.25,
+                )
+                if msg is None or not self._message_from_target(msg):
+                    continue
+
+                armed = bool(
+                    msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                )
+                self.armed = armed
+                self.mode = mavutil.mode_string_v10(msg)
+                if not armed:
+                    self.get_logger().info("Shutdown DISARM dogrulandi.")
+                    self._release_rc_override()
+                    return
+
+            self.get_logger().warn("Shutdown DISARM dogrulanamadi; komut gonderildi ama armed heartbeat devam ediyor.")
+        except Exception as exc:
+            self._publish_error(f"Shutdown DISARM hatasi: {exc}")
+
     def _cmd_vel_callback(self, msg):
-        if not self.connected:
-            self.last_steering_pwm = 1500
-            self.last_throttle_pwm = 1500
-            self.last_cmd_vel_time = 0.0
+        if not self._has_valid_link():
+            self._neutralize_outputs()
             if not self.cmd_vel_ignored_reported:
                 self.cmd_vel_ignored_reported = True
                 self.get_logger().warn(
@@ -340,9 +591,8 @@ class OrangeCubeBridgeNode(Node):
         if self.master is None:
             return
 
-        if not self.connected:
-            self.last_steering_pwm = 1500
-            self.last_throttle_pwm = 1500
+        if not self._has_valid_link():
+            self._neutralize_outputs()
             return
 
         if time.time() - self.last_cmd_vel_time > self.cmd_timeout_sec:
@@ -380,6 +630,7 @@ def main(args=None):
     except ExternalShutdownException:
         pass
     finally:
+        node.shutdown_vehicle()
         node.destroy_node()
         rclpy.shutdown()
 

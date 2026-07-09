@@ -1,3 +1,4 @@
+import signal
 from multiprocessing import shared_memory
 
 import numpy as np
@@ -37,6 +38,8 @@ def run_capture(
         stop_event=None,
         ready_queue=None,
 ):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     # ------------------------------------------------------------------
     # Open ZED Camera
     # ------------------------------------------------------------------

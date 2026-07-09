@@ -282,7 +282,7 @@ def wait_for_mission_services(node, clients):
     node.get_logger().info('Servisler hazir.')
 
 
-def call_set_mode(node, set_mode_client, mode_name):
+def call_set_mode(node, set_mode_client, mode_name, timeout_sec=5.0):
     """
     Mission node icinden mod degistirme servisini cagirir.
 
@@ -297,7 +297,11 @@ def call_set_mode(node, set_mode_client, mode_name):
     req.custom_mode = str(mode_name)
 
     future = set_mode_client.call_async(req)
-    rclpy.spin_until_future_complete(node, future)
+    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout_sec)
+
+    if not future.done():
+        node.get_logger().error(f'Mod degistirme zaman asimi: {mode_name}')
+        return False
 
     res = future.result()
 
@@ -309,7 +313,7 @@ def call_set_mode(node, set_mode_client, mode_name):
     return False
 
 
-def call_trigger_service(node, client, name):
+def call_trigger_service(node, client, name, timeout_sec=5.0):
     """
     ARM / DISARM gibi Trigger servislerini cagirir.
 
@@ -321,7 +325,11 @@ def call_trigger_service(node, client, name):
     req = Trigger.Request()
 
     future = client.call_async(req)
-    rclpy.spin_until_future_complete(node, future)
+    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout_sec)
+
+    if not future.done():
+        node.get_logger().error(f'{name} servis zaman asimi.')
+        return False
 
     res = future.result()
 
